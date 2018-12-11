@@ -9,7 +9,6 @@ package main
 
 import (
 	"bytes"
-	"cmd/internal/xcoff"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -21,6 +20,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"internal/xcoff"
 	"math"
 	"os"
 	"strconv"
@@ -91,7 +91,13 @@ func (p *Package) addToFlag(flag string, args []string) {
 	p.CgoFlags[flag] = append(p.CgoFlags[flag], args...)
 	if flag == "CFLAGS" {
 		// We'll also need these when preprocessing for dwarf information.
-		p.GccOptions = append(p.GccOptions, args...)
+		// However, discard any -g options: we need to be able
+		// to parse the debug info, so stick to what we expect.
+		for _, arg := range args {
+			if !strings.HasPrefix(arg, "-g") {
+				p.GccOptions = append(p.GccOptions, arg)
+			}
+		}
 	}
 }
 
@@ -164,6 +170,10 @@ func (p *Package) Translate(f *File) {
 		// Convert C.ulong to C.unsigned long, etc.
 		cref.Name.C = cname(cref.Name.Go)
 	}
+
+	var conv typeConv
+	conv.Init(p.PtrSize, p.IntSize)
+
 	p.loadDefines(f)
 	p.typedefs = map[string]bool{}
 	p.typedefList = nil
@@ -171,15 +181,17 @@ func (p *Package) Translate(f *File) {
 	for len(p.typedefs) > numTypedefs {
 		numTypedefs = len(p.typedefs)
 		// Also ask about any typedefs we've seen so far.
-		for _, a := range p.typedefList {
-			f.Name[a] = &Name{
-				Go: a,
-				C:  a,
+		for _, info := range p.typedefList {
+			n := &Name{
+				Go: info.typedef,
+				C:  info.typedef,
 			}
+			f.Name[info.typedef] = n
+			f.NamePos[n] = info.pos
 		}
 		needType := p.guessKinds(f)
 		if len(needType) > 0 {
-			p.loadDWARF(f, needType)
+			p.loadDWARF(f, &conv, needType)
 		}
 
 		// In godefs mode we're OK with the typedefs, which
@@ -474,7 +486,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 // loadDWARF parses the DWARF debug information generated
 // by gcc to learn the details of the constants, variables, and types
 // being referred to as C.xxx.
-func (p *Package) loadDWARF(f *File, names []*Name) {
+func (p *Package) loadDWARF(f *File, conv *typeConv, names []*Name) {
 	// Extract the types from the DWARF section of an object
 	// from a well-formed C program. Gcc only generates DWARF info
 	// for symbols in the object file, so it is not enough to print the
@@ -573,7 +585,7 @@ func (p *Package) loadDWARF(f *File, names []*Name) {
 				fatalf("malformed __cgo__ name: %s", name)
 			}
 			types[i] = t.Type
-			p.recordTypedefs(t.Type)
+			p.recordTypedefs(t.Type, f.NamePos[names[i]])
 		}
 		if e.Tag != dwarf.TagCompileUnit {
 			r.SkipChildren()
@@ -581,8 +593,6 @@ func (p *Package) loadDWARF(f *File, names []*Name) {
 	}
 
 	// Record types and typedef information.
-	var conv typeConv
-	conv.Init(p.PtrSize, p.IntSize)
 	for i, n := range names {
 		if strings.HasSuffix(n.Go, "GetTypeID") && types[i].String() == "func() CFTypeID" {
 			conv.getTypeIDs[n.Go[:len(n.Go)-9]] = true
@@ -641,10 +651,11 @@ func (p *Package) loadDWARF(f *File, names []*Name) {
 }
 
 // recordTypedefs remembers in p.typedefs all the typedefs used in dtypes and its children.
-func (p *Package) recordTypedefs(dtype dwarf.Type) {
-	p.recordTypedefs1(dtype, map[dwarf.Type]bool{})
+func (p *Package) recordTypedefs(dtype dwarf.Type, pos token.Pos) {
+	p.recordTypedefs1(dtype, pos, map[dwarf.Type]bool{})
 }
-func (p *Package) recordTypedefs1(dtype dwarf.Type, visited map[dwarf.Type]bool) {
+
+func (p *Package) recordTypedefs1(dtype dwarf.Type, pos token.Pos, visited map[dwarf.Type]bool) {
 	if dtype == nil {
 		return
 	}
@@ -660,23 +671,23 @@ func (p *Package) recordTypedefs1(dtype dwarf.Type, visited map[dwarf.Type]bool)
 		}
 		if !p.typedefs[dt.Name] {
 			p.typedefs[dt.Name] = true
-			p.typedefList = append(p.typedefList, dt.Name)
-			p.recordTypedefs1(dt.Type, visited)
+			p.typedefList = append(p.typedefList, typedefInfo{dt.Name, pos})
+			p.recordTypedefs1(dt.Type, pos, visited)
 		}
 	case *dwarf.PtrType:
-		p.recordTypedefs1(dt.Type, visited)
+		p.recordTypedefs1(dt.Type, pos, visited)
 	case *dwarf.ArrayType:
-		p.recordTypedefs1(dt.Type, visited)
+		p.recordTypedefs1(dt.Type, pos, visited)
 	case *dwarf.QualType:
-		p.recordTypedefs1(dt.Type, visited)
+		p.recordTypedefs1(dt.Type, pos, visited)
 	case *dwarf.FuncType:
-		p.recordTypedefs1(dt.ReturnType, visited)
+		p.recordTypedefs1(dt.ReturnType, pos, visited)
 		for _, a := range dt.ParamType {
-			p.recordTypedefs1(a, visited)
+			p.recordTypedefs1(a, pos, visited)
 		}
 	case *dwarf.StructType:
 		for _, f := range dt.Field {
-			p.recordTypedefs1(f.Type, visited)
+			p.recordTypedefs1(f.Type, pos, visited)
 		}
 	}
 }
@@ -716,9 +727,22 @@ func (p *Package) mangleName(n *Name) {
 	n.Mangle = prefix + n.Kind + "_" + n.Go
 }
 
+func (f *File) isMangledName(s string) bool {
+	prefix := "_C"
+	if strings.HasPrefix(s, prefix) {
+		t := s[len(prefix):]
+		for _, k := range nameKinds {
+			if strings.HasPrefix(t, k+"_") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // rewriteCalls rewrites all calls that pass pointers to check that
 // they follow the rules for passing pointers between Go and C.
-// This returns whether the package needs to import unsafe as _cgo_unsafe.
+// This reports whether the package needs to import unsafe as _cgo_unsafe.
 func (p *Package) rewriteCalls(f *File) bool {
 	needsUnsafe := false
 	// Walk backward so that in C.f1(C.f2()) we rewrite C.f2 first.
@@ -941,7 +965,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	return sb.String(), needsUnsafe
 }
 
-// needsPointerCheck returns whether the type t needs a pointer check.
+// needsPointerCheck reports whether the type t needs a pointer check.
 // This is true if t is a pointer and if the value to which it points
 // might contain a pointer.
 func (p *Package) needsPointerCheck(f *File, t ast.Expr, arg ast.Expr) bool {
@@ -958,7 +982,7 @@ func (p *Package) needsPointerCheck(f *File, t ast.Expr, arg ast.Expr) bool {
 
 // hasPointer is used by needsPointerCheck. If top is true it returns
 // whether t is or contains a pointer that might point to a pointer.
-// If top is false it returns whether t is or contains a pointer.
+// If top is false it reports whether t is or contains a pointer.
 // f may be nil.
 func (p *Package) hasPointer(f *File, t ast.Expr, top bool) bool {
 	switch t := t.(type) {
@@ -1172,7 +1196,7 @@ func (p *Package) checkAddr(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool
 	return true
 }
 
-// isType returns whether the expression is definitely a type.
+// isType reports whether the expression is definitely a type.
 // This is conservative--it returns false for an unknown identifier.
 func (p *Package) isType(t ast.Expr) bool {
 	switch t := t.(type) {
@@ -1214,7 +1238,7 @@ func (p *Package) isType(t ast.Expr) bool {
 	return false
 }
 
-// isConst returns whether x is an untyped constant expression.
+// isConst reports whether x is an untyped constant expression.
 func (p *Package) isConst(f *File, x ast.Expr) bool {
 	switch x := x.(type) {
 	case *ast.BasicLit:
@@ -1233,7 +1257,7 @@ func (p *Package) isConst(f *File, x ast.Expr) bool {
 			strings.HasPrefix(x.Name, "_Ciconst_") ||
 			strings.HasPrefix(x.Name, "_Cfconst_") ||
 			strings.HasPrefix(x.Name, "_Csconst_") ||
-			f.Consts[x.Name]
+			consts[x.Name]
 	case *ast.UnaryExpr:
 		return p.isConst(f, x.X)
 	case *ast.BinaryExpr:
@@ -1989,10 +2013,10 @@ func runGcc(stdin []byte, args []string) (string, string) {
 // with equivalent memory layout.
 type typeConv struct {
 	// Cache of already-translated or in-progress types.
-	m map[dwarf.Type]*Type
+	m map[string]*Type
 
 	// Map from types to incomplete pointers to those types.
-	ptrs map[dwarf.Type][]*Type
+	ptrs map[string][]*Type
 	// Keys of ptrs in insertion order (deterministic worklist)
 	// ptrKeys contains exactly the keys in ptrs.
 	ptrKeys []dwarf.Type
@@ -2027,8 +2051,8 @@ var unionWithPointer = make(map[ast.Expr]bool)
 func (c *typeConv) Init(ptrSize, intSize int64) {
 	c.ptrSize = ptrSize
 	c.intSize = intSize
-	c.m = make(map[dwarf.Type]*Type)
-	c.ptrs = make(map[dwarf.Type][]*Type)
+	c.m = make(map[string]*Type)
+	c.ptrs = make(map[string][]*Type)
 	c.getTypeIDs = make(map[string]bool)
 	c.bool = c.Ident("bool")
 	c.byte = c.Ident("byte")
@@ -2136,11 +2160,12 @@ func (c *typeConv) FinishType(pos token.Pos) {
 	// Keep looping until they're all done.
 	for len(c.ptrKeys) > 0 {
 		dtype := c.ptrKeys[0]
+		dtypeKey := dtype.String()
 		c.ptrKeys = c.ptrKeys[1:]
-		ptrs := c.ptrs[dtype]
-		delete(c.ptrs, dtype)
+		ptrs := c.ptrs[dtypeKey]
+		delete(c.ptrs, dtypeKey)
 
-		// Note Type might invalidate c.ptrs[dtype].
+		// Note Type might invalidate c.ptrs[dtypeKey].
 		t := c.Type(dtype, pos)
 		for _, ptr := range ptrs {
 			ptr.Go.(*ast.StarExpr).X = t.Go
@@ -2152,7 +2177,8 @@ func (c *typeConv) FinishType(pos token.Pos) {
 // Type returns a *Type with the same memory layout as
 // dtype when used as the type of a variable or a struct field.
 func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
-	if t, ok := c.m[dtype]; ok {
+	key := dtype.String()
+	if t, ok := c.m[key]; ok {
 		if t.Go == nil {
 			fatalf("%s: type conversion loop at %s", lineno(pos), dtype)
 		}
@@ -2163,7 +2189,7 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 	t.Size = dtype.Size() // note: wrong for array of pointers, corrected below
 	t.Align = -1
 	t.C = &TypeRepr{Repr: dtype.Common().Name}
-	c.m[dtype] = t
+	c.m[key] = t
 
 	switch dt := dtype.(type) {
 	default:
@@ -2326,10 +2352,11 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 		// Placeholder initialization; completed in FinishType.
 		t.Go = &ast.StarExpr{}
 		t.C.Set("<incomplete>*")
-		if _, ok := c.ptrs[dt.Type]; !ok {
+		key := dt.Type.String()
+		if _, ok := c.ptrs[key]; !ok {
 			c.ptrKeys = append(c.ptrKeys, dt.Type)
 		}
-		c.ptrs[dt.Type] = append(c.ptrs[dt.Type], t)
+		c.ptrs[key] = append(c.ptrs[key], t)
 
 	case *dwarf.QualType:
 		t1 := c.Type(dt.Type, pos)
@@ -2717,11 +2744,6 @@ func (c *typeConv) Struct(dt *dwarf.StructType, pos token.Pos) (expr *ast.Struct
 
 	anon := 0
 	for _, f := range dt.Field {
-		if f.ByteOffset > off {
-			fld, sizes = c.pad(fld, sizes, f.ByteOffset-off)
-			off = f.ByteOffset
-		}
-
 		name := f.Name
 		ft := f.Type
 
@@ -2770,6 +2792,19 @@ func (c *typeConv) Struct(dt *dwarf.StructType, pos token.Pos) (expr *ast.Struct
 			// structs are in system headers that cannot be corrected.
 			continue
 		}
+
+		// Round off up to talign, assumed to be a power of 2.
+		off = (off + talign - 1) &^ (talign - 1)
+
+		if f.ByteOffset > off {
+			fld, sizes = c.pad(fld, sizes, f.ByteOffset-off)
+			off = f.ByteOffset
+		}
+		if f.ByteOffset < off {
+			// Drop a packed field that we can't represent.
+			continue
+		}
+
 		n := len(fld)
 		fld = fld[0 : n+1]
 		if name == "" {
@@ -2819,7 +2854,7 @@ func (c *typeConv) Struct(dt *dwarf.StructType, pos token.Pos) (expr *ast.Struct
 	return
 }
 
-// dwarfHasPointer returns whether the DWARF type dt contains a pointer.
+// dwarfHasPointer reports whether the DWARF type dt contains a pointer.
 func (c *typeConv) dwarfHasPointer(dt dwarf.Type, pos token.Pos) bool {
 	switch dt := dt.(type) {
 	default:

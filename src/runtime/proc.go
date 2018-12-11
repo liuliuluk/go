@@ -3742,6 +3742,9 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 
 		// Collect Go stack that leads to the cgo call.
 		n = gentraceback(mp.curg.syscallpc, mp.curg.syscallsp, 0, mp.curg, 0, &stk[cgoOff], len(stk)-cgoOff, nil, nil, 0)
+		if n > 0 {
+			n += cgoOff
+		}
 	} else if traceback {
 		n = gentraceback(pc, sp, lr, gp, 0, &stk[0], len(stk), nil, nil, _TraceTrap|_TraceJumpStack)
 	}
@@ -4592,7 +4595,7 @@ func schedEnableUser(enable bool) {
 	}
 }
 
-// schedEnabled returns whether gp should be scheduled. It returns
+// schedEnabled reports whether gp should be scheduled. It returns
 // false is scheduling of gp is disabled.
 func schedEnabled(gp *g) bool {
 	if sched.disable.user {

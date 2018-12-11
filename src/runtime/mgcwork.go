@@ -93,6 +93,10 @@ type gcWork struct {
 	// termination check. Specifically, this indicates that this
 	// gcWork may have communicated work to another gcWork.
 	flushedWork bool
+
+	// pauseGen causes put operations to spin while pauseGen ==
+	// gcWorkPauseGen if debugCachedWork is true.
+	pauseGen uint32
 }
 
 // Most of the methods of gcWork are go:nowritebarrierrec because the
@@ -111,13 +115,29 @@ func (w *gcWork) init() {
 	w.wbuf2 = wbuf2
 }
 
+func (w *gcWork) checkPut(ptr uintptr, ptrs []uintptr) {
+	if debugCachedWork {
+		for atomic.Load(&gcWorkPauseGen) == w.pauseGen {
+		}
+		if throwOnGCWork {
+			printlock()
+			println("runtime: late gcWork put")
+			if ptr != 0 {
+				gcDumpObject("ptr", ptr, ^uintptr(0))
+			}
+			for _, ptr := range ptrs {
+				gcDumpObject("ptrs", ptr, ^uintptr(0))
+			}
+			throw("throwOnGCWork")
+		}
+	}
+}
+
 // put enqueues a pointer for the garbage collector to trace.
 // obj must point to the beginning of a heap object or an oblet.
 //go:nowritebarrierrec
 func (w *gcWork) put(obj uintptr) {
-	if throwOnGCWork {
-		throw("throwOnGCWork")
-	}
+	w.checkPut(obj, nil)
 
 	flushed := false
 	wbuf := w.wbuf1
@@ -153,9 +173,7 @@ func (w *gcWork) put(obj uintptr) {
 // otherwise it returns false and the caller needs to call put.
 //go:nowritebarrierrec
 func (w *gcWork) putFast(obj uintptr) bool {
-	if throwOnGCWork {
-		throw("throwOnGCWork")
-	}
+	w.checkPut(obj, nil)
 
 	wbuf := w.wbuf1
 	if wbuf == nil {
@@ -178,9 +196,7 @@ func (w *gcWork) putBatch(obj []uintptr) {
 		return
 	}
 
-	if throwOnGCWork {
-		throw("throwOnGCWork")
-	}
+	w.checkPut(0, obj)
 
 	flushed := false
 	wbuf := w.wbuf1
@@ -303,16 +319,12 @@ func (w *gcWork) balance() {
 		return
 	}
 	if wbuf := w.wbuf2; wbuf.nobj != 0 {
-		if throwOnGCWork {
-			throw("throwOnGCWork")
-		}
+		w.checkPut(0, wbuf.obj[:wbuf.nobj])
 		putfull(wbuf)
 		w.flushedWork = true
 		w.wbuf2 = getempty()
 	} else if wbuf := w.wbuf1; wbuf.nobj > 4 {
-		if throwOnGCWork {
-			throw("throwOnGCWork")
-		}
+		w.checkPut(0, wbuf.obj[:wbuf.nobj])
 		w.wbuf1 = handoff(wbuf)
 		w.flushedWork = true // handoff did putfull
 	} else {

@@ -2514,6 +2514,12 @@ func typecheckMethodExpr(n *Node) (res *Node) {
 	n.Xoffset = 0
 	n.SetClass(PFUNC)
 	// methodSym already marked n.Sym as a function.
+
+	// Issue 25065. Make sure that we emit the symbol for a local method.
+	if Ctxt.Flag_dynlink && !inimport && (t.Sym == nil || t.Sym.Pkg == localpkg) {
+		makefuncsym(n.Sym)
+	}
+
 	return n
 }
 
@@ -3073,10 +3079,16 @@ func typecheckcomplit(n *Node) (res *Node) {
 			if l.Op == OKEY {
 				l.Left = typecheck(l.Left, ctxExpr)
 				evconst(l.Left)
-				i = nonnegintconst(l.Left)
-				if i < 0 && !l.Left.Diag() {
-					yyerror("index must be non-negative integer constant")
-					l.Left.SetDiag(true)
+				i = indexconst(l.Left)
+				if i < 0 {
+					if !l.Left.Diag() {
+						if i == -2 {
+							yyerror("index too large")
+						} else {
+							yyerror("index must be non-negative integer constant")
+						}
+						l.Left.SetDiag(true)
+					}
 					i = -(1 << 30) // stay negative for a while
 				}
 				vp = &l.Right
